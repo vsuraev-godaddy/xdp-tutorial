@@ -1,0 +1,11 @@
+{
+	"ip":"127.0.0.1",
+	"zones": [
+		"example.com"
+	],
+	"iterations":100000,
+	"quic-port":853,
+	"exclude-dot":"true",
+	"exclude-quic":"true",
+	"cores":6
+}
