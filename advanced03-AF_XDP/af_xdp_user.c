@@ -26,6 +26,12 @@
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
 
+#include <linux/bpf.h>
+#include <linux/in.h>
+#include <bpf/bpf_endian.h>
+#include "../common/parsing_helpers.h"
+
+
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
@@ -48,13 +54,7 @@ struct xsk_umem_info {
 	struct xsk_umem *umem;
 	void *buffer;
 };
-struct stats_record {
-	uint64_t timestamp;
-	uint64_t rx_packets;
-	uint64_t rx_bytes;
-	uint64_t tx_packets;
-	uint64_t tx_bytes;
-};
+
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
@@ -65,9 +65,6 @@ struct xsk_socket_info {
 	uint32_t umem_frame_free;
 
 	uint32_t outstanding_tx;
-
-	struct stats_record stats;
-	struct stats_record prev_stats;
 };
 
 static inline __u32 xsk_ring_prod__free(struct xsk_ring_prod *r)
@@ -276,6 +273,151 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
+static const uint8_t dns_response_example_com[] = {
+    /* Header */
+    0x12, 0x34, 0x81, 0x80,
+    0x00, 0x01, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00,
+
+    /* Question: example.com */
+    0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+    0x03, 0x63, 0x6f, 0x6d,
+    0x00,
+    0x00, 0x01,
+    0x00, 0x01,
+
+     /* Answer */
+    0xc0, 0x0c,
+    0x00, 0x01,
+    0x00, 0x01,
+    0x00, 0x00, 0x00, 0x3c,
+    0x00, 0x04,
+    0x5d, 0xb8, 0xd8, 0x22
+};
+
+#include <stdint.h>
+//#include <netinet/udp.h>
+#include <arpa/inet.h>
+//#include <netinet/ip.h>
+
+#include <arpa/inet.h>
+
+void update_packet_length_and_csums(struct iphdr *iph, struct udphdr *udph, 
+                                    uint16_t old_udp_len, uint16_t new_udp_len) {
+    
+    // Calculate the raw delta between lengths
+    int32_t len_delta = (int32_t)new_udp_len - (int32_t)old_udp_len;
+    if (len_delta == 0) return; // No change needed
+
+    // ==========================================
+    // STEP 1: UPDATE L3 IP HEADER CHECKSUM
+    // ==========================================
+    uint16_t old_ip_tot_len = ntohs(iph->tot_len);
+    uint16_t new_ip_tot_len = old_ip_tot_len + len_delta;
+    
+    // Update the field in network byte order
+    iph->tot_len = htons(new_ip_tot_len);
+
+    // Incremental IP Checksum Update (RFC 1624)
+    uint32_t ip_csum = ~ntohs(iph->check) & 0xFFFF;
+    ip_csum += (uint16_t)(~old_ip_tot_len);
+    ip_csum += new_ip_tot_len;
+    while (ip_csum >> 16) {
+        ip_csum = (ip_csum & 0xFFFF) + (ip_csum >> 16);
+    }
+    iph->check = htons((uint16_t)(~ip_csum));
+
+    // ==========================================
+    // STEP 2: UPDATE L4 UDP HEADER & CHECKSUM
+    // ==========================================
+    // Apply new length directly to UDP header
+    udph->len = htons(new_udp_len);
+
+    // Read the existing UDP checksum field
+    uint32_t udp_csum = ~ntohs(udph->check) & 0xFFFF;
+
+    // A: Account for the UDP Header Length field modification
+    udp_csum += (uint16_t)(~old_udp_len);
+    udp_csum += new_udp_len;
+
+    // B: Account for the IP Pseudo-Header Length modification
+    // (The length is included twice in the mathematical sum: once in the UDP header, 
+    // and once in the virtual IP pseudo-header. Therefore, we must apply the delta twice.)
+    udp_csum += (uint16_t)(~old_udp_len);
+    udp_csum += new_udp_len;
+
+    // C: Fold the accumulated 32-bit values into a 16-bit word
+    while (udp_csum >> 16) {
+        udp_csum = (udp_csum & 0xFFFF) + (udp_csum >> 16);
+    }
+
+    uint16_t final_udp_csum = (uint16_t)(~udp_csum);
+
+    // Enforce RFC 768 rule for UDP zero sums
+    if (final_udp_csum == 0) {
+        final_udp_csum = 0xFFFF;
+    }
+
+    udph->check = htons(final_udp_csum);
+}
+
+
+void recalculate_full_ip_csum(struct iphdr *iph) {
+    // 1. Clear the existing checksum field before calculation
+    iph->check = 0;
+
+    uint32_t sum = 0;
+    // An IP header consists of 16-bit words. Clear the IHL to find the word count.
+    // iph->ihl represents the number of 32-bit words, so multiply by 2 for 16-bit words.
+    int num_words = iph->ihl * 2; 
+    uint16_t *ptr = (uint16_t *)iph;
+
+    // 2. Sum up all 16-bit words across the IP header
+    for (int i = 0; i < num_words; i++) {
+        sum += ntohs(ptr[i]);
+    }
+
+    // 3. Fold 32-bit sum into 16-bit
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    // 4. Invert and write back in Network Byte Order
+    iph->check = htons((uint16_t)(~sum));
+}
+
+
+
+// User-space equivalent function for incremental UDP checksum updates
+void udp_csum_update(struct udphdr *udph, uint16_t old_port, uint16_t new_port) {
+    // 1. Read the existing checksum (invert it to get the raw 1's complement sum)
+    uint32_t csum = ~ntohs(udph->check) & 0xFFFF;
+
+    // 2. Subtract the old value from the sum
+    csum += (uint16_t)(~old_port);
+    
+    // 3. Add the new value to the sum
+    csum += new_port;
+
+    // 4. Handle any math carries (fold 32-bit value into 16-bit)
+    while (csum >> 16) {
+        csum = (csum & 0xFFFF) + (csum >> 16);
+    }
+
+    // 5. Re-invert to get the final 1's complement result
+    uint16_t final_csum = (uint16_t)(~csum);
+
+    // RFC 768 Rule: If the computed checksum is 0, it must be sent as 0xFFFF
+    if (final_csum == 0) {
+        final_csum = 0xFFFF;
+    }
+
+    // 6. Write back to the UDP header in Network Byte Order
+    udph->check = htons(final_csum);
+}
+
+
+
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
@@ -289,54 +431,81 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	 * - Just return all data with MAC/IP swapped, and type set to
 	 *   ICMPV6_ECHO_REPLY
 	 * - Recalculate the icmp checksum */
+	printf("%s %d addr %x len %d\n",__FILE__,__LINE__,addr,len);
+	int ret;
+	uint32_t tx_idx = 0;
+	uint8_t tmp_mac[ETH_ALEN];
 
-	if (false) {
-		int ret;
-		uint32_t tx_idx = 0;
-		uint8_t tmp_mac[ETH_ALEN];
+	struct hdr_cursor nh;
+	int nh_type, ip_type = 0;
+	struct iphdr *iph;
+	struct udphdr *udphdr;
+	nh.pos = pkt;
+
+	struct ethhdr *eth;
+	nh_type = parse_ethhdr(&nh, pkt + len, &eth);
+	if (nh_type < 0)
+		return false;
+
+	// Copy Source MAC to temporary storage
+	memcpy(tmp_mac, eth->h_source, ETH_ALEN);
+	// Copy Destination MAC to Source MAC
+	memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+	// Copy temporary storage to Destination MAC
+	memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
+
+	if (nh_type == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6h;
+
+		ip_type = parse_ip6hdr(&nh, pkt + len, &ip6h);
 		struct in6_addr tmp_ip;
-		struct ethhdr *eth = (struct ethhdr *) pkt;
-		struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-		struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
 
-		if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-		    len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-		    ipv6->nexthdr != IPPROTO_ICMPV6 ||
-		    icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-			return false;
+		// Copy Source IP to temporary storage
+		memcpy(&tmp_ip, &ip6h->saddr, sizeof(struct in6_addr));
+		// Copy Destination IP to Source IP
+		memcpy(&ip6h->saddr, &ip6h->daddr, sizeof(struct in6_addr));
+		// Copy temporary storage to Destination IP
+		memcpy(&ip6h->daddr, &tmp_ip, sizeof(struct in6_addr));
+		printf("%s %d\n",__FILE__,__LINE__);
 
-		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-		memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-		memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-		memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
-
-		icmp->icmp6_type = ICMPV6_ECHO_REPLY;
-
-		csum_replace2(&icmp->icmp6_cksum,
-			      htons(ICMPV6_ECHO_REQUEST << 8),
-			      htons(ICMPV6_ECHO_REPLY << 8));
-
-		/* Here we sent the packet out of the receive port. Note that
-		 * we allocate one entry and schedule it. Your design would be
-		 * faster if you do batch processing/transmission */
-
-		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-		if (ret != 1) {
-			/* No more transmit slots, drop the packet */
+	} else if (nh_type == bpf_htons(ETH_P_IP)) {
+		ip_type = parse_iphdr(&nh, pkt + len, &iph);
+		printf("%s %d %x %x\n",__FILE__,__LINE__,ntohl(iph->daddr), ntohl(iph->saddr));
+	}
+	if (ip_type == IPPROTO_UDP) {
+		if (parse_udphdr(&nh, pkt + len, &udphdr) < 0) {
 			return false;
 		}
-
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-		xsk_ring_prod__submit(&xsk->tx, 1);
-		xsk->outstanding_tx++;
-
-		xsk->stats.tx_bytes += len;
-		xsk->stats.tx_packets++;
-		return true;
+		printf("%s %d %x %x\n",__FILE__,__LINE__,ntohs(udphdr->dest), ntohs(udphdr->source));
+		if (bpf_ntohs(udphdr->dest) == 53){
+			ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+			if (ret != 1) {
+				/* No more transmit slots, drop the packet */
+				return false;
+			}
+			uint8_t *dns = (uint8_t *)(udphdr + 1);
+			memcpy(dns, dns_response_example_com, sizeof(dns_response_example_com));
+			if (nh_type == bpf_htons(ETH_P_IP)){
+				uint32_t tmp = iph->daddr;
+				iph->daddr = iph->saddr;
+				iph->saddr = tmp;
+//				recalculate_full_ip_csum(iph);
+			}else{
+			}
+			uint16_t temp_port = udphdr->source;
+			udphdr->source = udphdr->dest;
+			udphdr->dest = temp_port;
+			update_packet_length_and_csums(iph, udphdr, ntohs(udphdr->len), sizeof(dns_response_example_com));
+//			udphdr->len = htons(sizeof(dns_response_example_com));
+			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = (dns - pkt) + sizeof(dns_response_example_com);
+			xsk_ring_prod__submit(&xsk->tx, 1);
+			xsk->outstanding_tx++;
+			printf("%s %d %d %d\n",__FILE__,__LINE__,(dns - pkt),(dns-pkt) + sizeof(dns_response_example_com));
+			return true;
+		}
+	}else{
+		return false;
 	}
 
 	return false;
@@ -381,11 +550,9 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 		if (!process_packet(xsk, addr, len))
 			xsk_free_umem_frame(xsk, addr);
 
-		xsk->stats.rx_bytes += len;
 	}
 
 	xsk_ring_cons__release(&xsk->rx, rcvd);
-	xsk->stats.rx_packets += rcvd;
 
 	/* Do we need to wake up the kernel for transmission */
 	complete_tx(xsk);
@@ -411,91 +578,6 @@ static void rx_and_process(struct config *cfg,
 	}
 }
 
-#define NANOSEC_PER_SEC 1000000000 /* 10^9 */
-static uint64_t gettime(void)
-{
-	struct timespec t;
-	int res;
-
-	res = clock_gettime(CLOCK_MONOTONIC, &t);
-	if (res < 0) {
-		fprintf(stderr, "Error with gettimeofday! (%i)\n", res);
-		exit(EXIT_FAIL);
-	}
-	return (uint64_t) t.tv_sec * NANOSEC_PER_SEC + t.tv_nsec;
-}
-
-static double calc_period(struct stats_record *r, struct stats_record *p)
-{
-	double period_ = 0;
-	__u64 period = 0;
-
-	period = r->timestamp - p->timestamp;
-	if (period > 0)
-		period_ = ((double) period / NANOSEC_PER_SEC);
-
-	return period_;
-}
-
-static void stats_print(struct stats_record *stats_rec,
-			struct stats_record *stats_prev)
-{
-	uint64_t packets, bytes;
-	double period;
-	double pps; /* packets per sec */
-	double bps; /* bits per sec */
-
-	char *fmt = "%-12s %'11lld pkts (%'10.0f pps)"
-		" %'11lld Kbytes (%'6.0f Mbits/s)"
-		" period:%f\n";
-
-	period = calc_period(stats_rec, stats_prev);
-	if (period == 0)
-		period = 1;
-
-	packets = stats_rec->rx_packets - stats_prev->rx_packets;
-	pps     = packets / period;
-
-	bytes   = stats_rec->rx_bytes   - stats_prev->rx_bytes;
-	bps     = (bytes * 8) / period / 1000000;
-
-	printf(fmt, "AF_XDP RX:", stats_rec->rx_packets, pps,
-	       stats_rec->rx_bytes / 1000 , bps,
-	       period);
-
-	packets = stats_rec->tx_packets - stats_prev->tx_packets;
-	pps     = packets / period;
-
-	bytes   = stats_rec->tx_bytes   - stats_prev->tx_bytes;
-	bps     = (bytes * 8) / period / 1000000;
-
-	printf(fmt, "       TX:", stats_rec->tx_packets, pps,
-	       stats_rec->tx_bytes / 1000 , bps,
-	       period);
-
-	printf("\n");
-}
-
-static void *stats_poll(void *arg)
-{
-	unsigned int interval = 2;
-	struct xsk_socket_info *xsk = arg;
-	static struct stats_record previous_stats = { 0 };
-
-	previous_stats.timestamp = gettime();
-
-	/* Trick to pretty printf with thousands separators use %' */
-	setlocale(LC_NUMERIC, "en_US");
-
-	while (!global_exit) {
-		sleep(interval);
-		xsk->stats.timestamp = gettime();
-		stats_print(&xsk->stats, &previous_stats);
-		previous_stats = xsk->stats;
-	}
-	return NULL;
-}
-
 static void exit_application(int signal)
 {
 	int err;
@@ -513,13 +595,11 @@ static void exit_application(int signal)
 
 int main(int argc, char **argv)
 {
-	int ret;
 	void *packet_buffer;
 	uint64_t packet_buffer_size;
 	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
 	struct xsk_umem_info *umem;
 	struct xsk_socket_info *xsk_socket;
-	pthread_t stats_poll_thread;
 	int err;
 	char errmsg[1024];
 
@@ -613,17 +693,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
 			strerror(errno));
 		exit(EXIT_FAILURE);
-	}
-
-	/* Start thread to do statistics display */
-	if (verbose) {
-		ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
-				     xsk_socket);
-		if (ret) {
-			fprintf(stderr, "ERROR: Failed creating statistics thread "
-				"\"%s\"\n", strerror(errno));
-			exit(EXIT_FAILURE);
-		}
 	}
 
 	/* Receive and count packets than drop them */
