@@ -302,121 +302,82 @@ static const uint8_t dns_response_example_com[] = {
 
 #include <arpa/inet.h>
 
-void update_packet_length_and_csums(struct iphdr *iph, struct udphdr *udph, 
-                                    uint16_t old_udp_len, uint16_t new_udp_len) {
+/* IPv4 UDP checksum over pseudo-header + UDP header (check=0) + payload (RFC 768 / 1071). */
+ static void recalculate_full_udp_csum_ipv4(const struct iphdr *iph, struct udphdr *udph){
+            uint32_t sum = 0;
+            __u32 saddr = ntohl(iph->saddr);
+            __u32 daddr = ntohl(iph->daddr);
+
+            sum += (saddr >> 16) & 0xffff;
+            sum += saddr & 0xffff;
+            sum += (daddr >> 16) & 0xffff;
+            sum += daddr & 0xffff;
+            sum += IPPROTO_UDP;
+            sum += ntohs(udph->len);
+
+            udph->check = 0;
+
+            sum += ntohs(udph->source);
+            sum += ntohs(udph->dest);
+            sum += ntohs(udph->len);
+            sum += ntohs(udph->check);
+
+            uint8_t *payload = (uint8_t *)(udph + 1);
+            size_t ulen = ntohs(udph->len);
+            size_t hlen = sizeof(struct udphdr);
+
+            if (ulen < hlen)
+                    return;
+
+            size_t plen = ulen - hlen;
+            size_t i;
+
+            for (i = 0; i + 1 < plen; i += 2)
+                    sum += ((uint16_t)payload[i] << 8) | payload[i + 1];
+            if (i < plen)
+                    sum += (uint16_t)payload[i] << 8;
+
+            while (sum >> 16)
+                    sum = (sum & 0xffff) + (sum >> 16);
+
+            uint16_t csum = (uint16_t)~sum;
+
+            if (csum == 0)
+                    csum = 0xffff;
+            udph->check = htons(csum);
+ }
+
+ void update_packet_length_and_csums(struct iphdr *iph, struct udphdr *udph,
+                                        uint16_t old_udp_len, uint16_t new_udp_len) {
     
-    // Calculate the raw delta between lengths
-    int32_t len_delta = (int32_t)new_udp_len - (int32_t)old_udp_len;
-    if (len_delta == 0) return; // No change needed
-
-    // ==========================================
-    // STEP 1: UPDATE L3 IP HEADER CHECKSUM
-    // ==========================================
-    uint16_t old_ip_tot_len = ntohs(iph->tot_len);
-    uint16_t new_ip_tot_len = old_ip_tot_len + len_delta;
+        // Calculate the raw delta between lengths
+        int32_t len_delta = (int32_t)new_udp_len - (int32_t)old_udp_len;
+        if (len_delta == 0) return; // No change needed
     
-    // Update the field in network byte order
-    iph->tot_len = htons(new_ip_tot_len);
-
-    // Incremental IP Checksum Update (RFC 1624)
-    uint32_t ip_csum = ~ntohs(iph->check) & 0xFFFF;
-    ip_csum += (uint16_t)(~old_ip_tot_len);
-    ip_csum += new_ip_tot_len;
-    while (ip_csum >> 16) {
-        ip_csum = (ip_csum & 0xFFFF) + (ip_csum >> 16);
-    }
-    iph->check = htons((uint16_t)(~ip_csum));
-
-    // ==========================================
-    // STEP 2: UPDATE L4 UDP HEADER & CHECKSUM
-    // ==========================================
-    // Apply new length directly to UDP header
-    udph->len = htons(new_udp_len);
-
-    // Read the existing UDP checksum field
-    uint32_t udp_csum = ~ntohs(udph->check) & 0xFFFF;
-
-    // A: Account for the UDP Header Length field modification
-    udp_csum += (uint16_t)(~old_udp_len);
-    udp_csum += new_udp_len;
-
-    // B: Account for the IP Pseudo-Header Length modification
-    // (The length is included twice in the mathematical sum: once in the UDP header, 
-    // and once in the virtual IP pseudo-header. Therefore, we must apply the delta twice.)
-    udp_csum += (uint16_t)(~old_udp_len);
-    udp_csum += new_udp_len;
-
-    // C: Fold the accumulated 32-bit values into a 16-bit word
-    while (udp_csum >> 16) {
-        udp_csum = (udp_csum & 0xFFFF) + (udp_csum >> 16);
-    }
-
-    uint16_t final_udp_csum = (uint16_t)(~udp_csum);
-
-    // Enforce RFC 768 rule for UDP zero sums
-    if (final_udp_csum == 0) {
-        final_udp_csum = 0xFFFF;
-    }
-
-    udph->check = htons(final_udp_csum);
-}
-
-
-void recalculate_full_ip_csum(struct iphdr *iph) {
-    // 1. Clear the existing checksum field before calculation
-    iph->check = 0;
-
-    uint32_t sum = 0;
-    // An IP header consists of 16-bit words. Clear the IHL to find the word count.
-    // iph->ihl represents the number of 32-bit words, so multiply by 2 for 16-bit words.
-    int num_words = iph->ihl * 2; 
-    uint16_t *ptr = (uint16_t *)iph;
-
-    // 2. Sum up all 16-bit words across the IP header
-    for (int i = 0; i < num_words; i++) {
-        sum += ntohs(ptr[i]);
-    }
-
-    // 3. Fold 32-bit sum into 16-bit
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-
-    // 4. Invert and write back in Network Byte Order
-    iph->check = htons((uint16_t)(~sum));
-}
-
-
-
-// User-space equivalent function for incremental UDP checksum updates
-void udp_csum_update(struct udphdr *udph, uint16_t old_port, uint16_t new_port) {
-    // 1. Read the existing checksum (invert it to get the raw 1's complement sum)
-    uint32_t csum = ~ntohs(udph->check) & 0xFFFF;
-
-    // 2. Subtract the old value from the sum
-    csum += (uint16_t)(~old_port);
+        // ==========================================
+        // STEP 1: UPDATE L3 IP HEADER CHECKSUM
+        // ==========================================
+        uint16_t old_ip_tot_len = ntohs(iph->tot_len);
+        uint16_t new_ip_tot_len = old_ip_tot_len + len_delta;
     
-    // 3. Add the new value to the sum
-    csum += new_port;
-
-    // 4. Handle any math carries (fold 32-bit value into 16-bit)
-    while (csum >> 16) {
-        csum = (csum & 0xFFFF) + (csum >> 16);
-    }
-
-    // 5. Re-invert to get the final 1's complement result
-    uint16_t final_csum = (uint16_t)(~csum);
-
-    // RFC 768 Rule: If the computed checksum is 0, it must be sent as 0xFFFF
-    if (final_csum == 0) {
-        final_csum = 0xFFFF;
-    }
-
-    // 6. Write back to the UDP header in Network Byte Order
-    udph->check = htons(final_csum);
+        // Update the field in network byte order
+        iph->tot_len = htons(new_ip_tot_len);
+    
+        // Incremental IP Checksum Update (RFC 1624)
+        uint32_t ip_csum = ~ntohs(iph->check) & 0xFFFF;
+        ip_csum += (uint16_t)(~old_ip_tot_len);
+        ip_csum += new_ip_tot_len;
+        while (ip_csum >> 16) {
+            ip_csum = (ip_csum & 0xFFFF) + (ip_csum >> 16);
+        }
+        iph->check = htons((uint16_t)(~ip_csum));
+    
+        // ==========================================
+        // STEP 2: UPDATE L4 UDP HEADER & CHECKSUM
+        // ==========================================
+        udph->len = htons(new_udp_len);
+        recalculate_full_udp_csum_ipv4(iph, udph);
 }
-
-
 
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
@@ -431,7 +392,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	 * - Just return all data with MAC/IP swapped, and type set to
 	 *   ICMPV6_ECHO_REPLY
 	 * - Recalculate the icmp checksum */
-	printf("%s %d addr %x len %d\n",__FILE__,__LINE__,addr,len);
 	int ret;
 	uint32_t tx_idx = 0;
 	uint8_t tmp_mac[ETH_ALEN];
@@ -466,17 +426,14 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		memcpy(&ip6h->saddr, &ip6h->daddr, sizeof(struct in6_addr));
 		// Copy temporary storage to Destination IP
 		memcpy(&ip6h->daddr, &tmp_ip, sizeof(struct in6_addr));
-		printf("%s %d\n",__FILE__,__LINE__);
 
 	} else if (nh_type == bpf_htons(ETH_P_IP)) {
 		ip_type = parse_iphdr(&nh, pkt + len, &iph);
-		printf("%s %d %x %x\n",__FILE__,__LINE__,ntohl(iph->daddr), ntohl(iph->saddr));
 	}
 	if (ip_type == IPPROTO_UDP) {
 		if (parse_udphdr(&nh, pkt + len, &udphdr) < 0) {
 			return false;
 		}
-		printf("%s %d %x %x\n",__FILE__,__LINE__,ntohs(udphdr->dest), ntohs(udphdr->source));
 		if (bpf_ntohs(udphdr->dest) == 53){
 			ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
 			if (ret != 1) {
@@ -484,7 +441,12 @@ static bool process_packet(struct xsk_socket_info *xsk,
 				return false;
 			}
 			uint8_t *dns = (uint8_t *)(udphdr + 1);
-			memcpy(dns, dns_response_example_com, sizeof(dns_response_example_com));
+			uint16_t client_tx_id = *(uint16_t *)dns;
+
+			// Overwrite the first 2 bytes of your static reply template in-memory 
+			// // (Directly updates the '0x12, 0x34' placeholder to match the client)
+//			*(uint16_t *)dns = client_tx_id; 
+			memcpy(&dns[2], &dns_response_example_com[2], sizeof(dns_response_example_com)-2);
 			if (nh_type == bpf_htons(ETH_P_IP)){
 				uint32_t tmp = iph->daddr;
 				iph->daddr = iph->saddr;
@@ -495,13 +457,11 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			uint16_t temp_port = udphdr->source;
 			udphdr->source = udphdr->dest;
 			udphdr->dest = temp_port;
-			update_packet_length_and_csums(iph, udphdr, ntohs(udphdr->len), sizeof(dns_response_example_com));
-//			udphdr->len = htons(sizeof(dns_response_example_com));
+			update_packet_length_and_csums(iph, udphdr, ntohs(udphdr->len), sizeof(dns_response_example_com)+8);
 			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
 			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = (dns - pkt) + sizeof(dns_response_example_com);
 			xsk_ring_prod__submit(&xsk->tx, 1);
 			xsk->outstanding_tx++;
-			printf("%s %d %d %d\n",__FILE__,__LINE__,(dns - pkt),(dns-pkt) + sizeof(dns_response_example_com));
 			return true;
 		}
 	}else{
