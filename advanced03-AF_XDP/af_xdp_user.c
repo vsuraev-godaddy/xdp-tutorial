@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <sys/resource.h>
@@ -121,6 +122,14 @@ static const struct option_wrapper long_options[] = {
 
 static bool global_exit;
 
+struct xsk_umem_config mem_cfg = {
+    .fill_size = NUM_FRAMES / 2,
+    .comp_size = NUM_FRAMES / 2,
+    .frame_size = FRAME_SIZE,
+    .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+    .flags = 0 // Can use XSK_UMEM__USES_NEED_WAKEUP for performance
+};
+
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 {
 	struct xsk_umem_info *umem;
@@ -131,9 +140,10 @@ static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 		return NULL;
 
 	ret = xsk_umem__create(&umem->umem, buffer, size, &umem->fq, &umem->cq,
-			       NULL);
+			       &mem_cfg);
 	if (ret) {
 		errno = -ret;
+		printf("%s %d\n",__FILE__,__LINE__);
 		return NULL;
 	}
 
@@ -273,6 +283,7 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
+#if 1
 static const uint8_t dns_response_example_com[] = {
     /* Header */
     0x12, 0x34, 0x81, 0x80,
@@ -294,6 +305,44 @@ static const uint8_t dns_response_example_com[] = {
     0x00, 0x04,
     0x5d, 0xb8, 0xd8, 0x22
 };
+#else
+const uint8_t dns_response_example_com[] = {
+    // --- HEADER (12 bytes) ---
+    0xAA, 0xAA, // Transaction ID (0xAAAA)
+    0x81, 0x80, // Flags: Standard response, NoError, Authoritative, No Recursion
+    0x00, 0x01, // Questions: 1
+    0x00, 0x01, // Answer RRs: 1 (SOA)
+    0x00, 0x00, // Authority RRs: 0
+    0x00, 0x00, // Additional RRs: 0
+
+    // --- QUESTION SECTION ---
+     /* Question: example.com */
+    0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+    0x03, 0x63, 0x6f, 0x6d,
+    0x00,
+    0x00, 0x01,
+    0x00, 0x01,
+
+    // --- ANSWER SECTION (SOA) ---
+    0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+    0x03, 0x63, 0x6f, 0x6d,
+    0x00, 0x01, // Type: SOA
+    0x00, 0x01, // Class: IN
+    0x00, 0x00, 0x0e, 0x10, // TTL: 3600 (1 hour)
+    0x00, 0x24, // RDLENGTH: 36 bytes (Data length)
+
+    // SOA Data
+    // MNAME: ns1.example.com (3ns1 + 7example + 3com + 0)
+    0x03, 'n', 's', '1', 0xc0, 0x10, // ns1.example.com
+    // RNAME: hostmaster.example.com
+    0x0a, 'h', 'o', 's', 't', 'm', 'a', 's', 't', 'e', 'r', 0xc0, 0x10, 
+    0x66, 0x6e, 0x1a, 0x50, // Serial: 1717581392
+    0x00, 0x00, 0x0e, 0x10, // Refresh: 3600
+    0x00, 0x00, 0x03, 0x84, // Retry: 900
+    0x00, 0x09, 0x3a, 0x80, // Expire: 604800
+    0x00, 0x00, 0x0e, 0x10  // Minimum TTL: 3600
+};
+#endif
 
 #include <stdint.h>
 //#include <netinet/udp.h>
@@ -630,7 +679,8 @@ int main(int argc, char **argv)
 	}
 
 	/* Allocate memory for NUM_FRAMES of the default XDP frame size */
-	packet_buffer_size = NUM_FRAMES * FRAME_SIZE;
+	packet_buffer_size = ((NUM_FRAMES * FRAME_SIZE)/2097152)*2097152;
+#if 0
 	if (posix_memalign(&packet_buffer,
 			   getpagesize(), /* PAGE_SIZE aligned */
 			   packet_buffer_size)) {
@@ -638,6 +688,14 @@ int main(int argc, char **argv)
 			strerror(errno));
 		exit(EXIT_FAILURE);
 	}
+#else
+	packet_buffer = mmap(NULL, packet_buffer_size, PROT_READ | PROT_WRITE, 
+			                  MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (packet_buffer == NULL){
+		printf("cannot allocate mapped memory\n");
+		exit(EXIT_FAILURE);
+	}
+#endif
 
 	/* Initialize shared packet_buffer for umem usage */
 	umem = configure_xsk_umem(packet_buffer, packet_buffer_size);
