@@ -5,6 +5,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "../common/parsing_helpers.h"
+#include <string.h>
 
 struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);
@@ -26,10 +27,15 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	struct udphdr *udphdr;
 	nh.pos = data;
 
+//	static const char* trace_msg = "XDP: on packet\n";
+//	bpf_trace_printk(trace_msg, (int)strlen(trace_msg));
 	struct ethhdr *eth;
 	nh_type = parse_ethhdr(&nh, data_end, &eth);
-	if (nh_type < 0)
+	if (nh_type < 0){
+		static const char* err_msg = "XDP: cannot parse ethernet\n";
+		bpf_trace_printk(err_msg, (int)strlen(err_msg));
 		return XDP_PASS;
+	}
 
 	if (nh_type == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6h;
@@ -44,11 +50,17 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	if (ip_type == IPPROTO_UDP) {
 		if (parse_udphdr(&nh, data_end, &udphdr) < 0) {
 			action = XDP_ABORTED;
+			static const char *err_msg = "XDP: cannot parse UDP\n";
+			bpf_trace_printk(err_msg, strlen(err_msg));
 			goto out;
 		}
 		if (bpf_ntohs(udphdr->dest) == 53){
-			if (bpf_map_lookup_elem(&xsks_map, &index))
+			if (bpf_map_lookup_elem(&xsks_map, &index)){
 				return bpf_redirect_map(&xsks_map, index, 0);
+			}
+		}else{
+//			static const char *err_msg = "XDP: UDP other than 53 received on interface\n";
+//			bpf_trace_printk(err_msg,strlen(err_msg));
 		}
 	}else{
 		goto out;

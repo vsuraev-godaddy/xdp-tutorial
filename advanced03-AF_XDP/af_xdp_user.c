@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-
+#define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
 #include <getopt.h>
@@ -13,6 +13,7 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <sys/resource.h>
 
@@ -37,10 +38,14 @@
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
 
+#define BATCH_SIZE 32
 #define NUM_FRAMES         4096
 #define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
-#define RX_BATCH_SIZE      64
+#define RX_BATCH_SIZE      BATCH_SIZE
 #define INVALID_UMEM_FRAME UINT64_MAX
+
+
+#define TX_FLUSH_TIMEOUT_NS  25000 //50000 // 50 microseconds flush timeout
 
 static struct xdp_program *prog;
 int xsk_map_fd;
@@ -127,8 +132,17 @@ struct xsk_umem_config mem_cfg = {
     .comp_size = NUM_FRAMES / 2,
     .frame_size = FRAME_SIZE,
     .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
-    .flags = 0 // Can use XSK_UMEM__USES_NEED_WAKEUP for performance
+    .flags = 0
 };
+#if 0
+struct xsk_socket_config xsk_cfg = {
+    .rx_size = NUM_FRAMES / 2,
+    .tx_size = NUM_FRAMES / 2,
+    .libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD,
+    .xdp_flags = XDP_FLAGS_DRV_MODE,          // Enforce Native Driver mode
+    .bind_flags = XDP_ZEROCOPY                 // STRICT: Fail if ZC isn't supported
+};
+#endif
 
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 {
@@ -174,8 +188,32 @@ static uint64_t xsk_umem_free_frames(struct xsk_socket_info *xsk)
 	return xsk->umem_frame_free;
 }
 
+void check_zerocopy_status(struct xsk_socket *xsk) {
+    // 1. Extract the raw underlying Linux file descriptor from the libxdp struct
+    int fd = xsk_socket__fd(xsk);
+    
+    // 2. Instantiate the option carrier layout
+    struct xdp_options opts = {0};
+    socklen_t optlen = sizeof(opts);
+
+    // 3. Query the kernel's active parameter configurations
+    if (getsockopt(fd, SOL_XDP, XDP_OPTIONS, &opts, &optlen) < 0) {
+        perror("Failed to retrieve XDP options flags");
+        return;
+    }
+
+    // 4. Evaluate the bitmask flag state
+    if (opts.flags & XDP_OPTIONS_ZEROCOPY) {
+        printf(" SUCCESS: Socket is operating in hardware ZERO-COPY mode.\n");
+    } else {
+        printf(" WARNING: Socket fell back to standard COPY mode.\n");
+    }
+}
+
+
 static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
-						    struct xsk_umem_info *umem)
+						    struct xsk_umem_info *umem,
+						    int queue_idx)
 {
 	struct xsk_socket_config xsk_cfg;
 	struct xsk_socket_info *xsk_info;
@@ -189,17 +227,24 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 		return NULL;
 
 	xsk_info->umem = umem;
-	xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
-	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-	xsk_cfg.xdp_flags = cfg->xdp_flags;
-	xsk_cfg.bind_flags = cfg->xsk_bind_flags;
+	xsk_cfg.rx_size = NUM_FRAMES / 2/*XSK_RING_CONS__DEFAULT_NUM_DESCS*/;
+	xsk_cfg.tx_size = NUM_FRAMES / 2/*XSK_RING_PROD__DEFAULT_NUM_DESCS*/;
+	xsk_cfg.xdp_flags = /*XDP_FLAGS_DRV_MODE*/cfg->xdp_flags;
+	xsk_cfg.bind_flags = /*XDP_COPY*/cfg->xsk_bind_flags;
 	xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD: 0;
 	ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
-				 cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
+				 /*cfg->xsk_if_queue*/queue_idx, umem->umem, &xsk_info->rx,
 				 &xsk_info->tx, &xsk_cfg);
 	if (ret)
 		goto error_exit;
 
+	int sock_fd = xsk_socket__fd(xsk_info->xsk);
+	int busy_poll_val = 50; // Match sysctl limits
+	setsockopt(sock_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_val, sizeof(busy_poll_val));
+
+	// Enable batch-preferring modes
+	int busy_loop_prefer_batch = 1;
+	setsockopt(sock_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &busy_loop_prefer_batch, sizeof(busy_loop_prefer_batch));
 	if (custom_xsk) {
 		ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
 		if (ret)
@@ -245,8 +290,9 @@ static void complete_tx(struct xsk_socket_info *xsk)
 
 	if (!xsk->outstanding_tx)
 		return;
-
-	sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	if (xsk_ring_prod__needs_wakeup(&xsk->tx)) {
+		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	}
 
 	/* Collect/free completed TX buffers */
 	completed = xsk_ring_cons__peek(&xsk->umem->cq,
@@ -303,7 +349,7 @@ static const uint8_t dns_response_example_com[] = {
     0x00, 0x01,
     0x00, 0x00, 0x00, 0x3c,
     0x00, 0x04,
-    0x5d, 0xb8, 0xd8, 0x22
+    0x5d, 0xb8, 0xd8, 0x23
 };
 #else
 const uint8_t dns_response_example_com[] = {
@@ -429,7 +475,7 @@ const uint8_t dns_response_example_com[] = {
 }
 
 static bool process_packet(struct xsk_socket_info *xsk,
-			   uint64_t addr, uint32_t len)
+			   uint64_t addr, uint32_t len, uint32_t tx_idx)
 {
 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
@@ -442,13 +488,12 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	 *   ICMPV6_ECHO_REPLY
 	 * - Recalculate the icmp checksum */
 	int ret;
-	uint32_t tx_idx = 0;
 	uint8_t tmp_mac[ETH_ALEN];
 
 	struct hdr_cursor nh;
 	int nh_type, ip_type = 0;
-	struct iphdr *iph;
-	struct udphdr *udphdr;
+	struct iphdr *iph = NULL;
+	struct udphdr *udphdr = NULL;
 	nh.pos = pkt;
 
 	struct ethhdr *eth;
@@ -464,7 +509,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
 
 	if (nh_type == bpf_htons(ETH_P_IPV6)) {
-		struct ipv6hdr *ip6h;
+		struct ipv6hdr *ip6h = NULL;
 
 		ip_type = parse_ip6hdr(&nh, pkt + len, &ip6h);
 		struct in6_addr tmp_ip;
@@ -484,11 +529,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			return false;
 		}
 		if (bpf_ntohs(udphdr->dest) == 53){
-			ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-			if (ret != 1) {
-				/* No more transmit slots, drop the packet */
-				return false;
-			}
 			uint8_t *dns = (uint8_t *)(udphdr + 1);
 			uint16_t client_tx_id = *(uint16_t *)dns;
 
@@ -509,8 +549,8 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			update_packet_length_and_csums(iph, udphdr, ntohs(udphdr->len), sizeof(dns_response_example_com)+8);
 			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
 			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = (dns - pkt) + sizeof(dns_response_example_com);
-			xsk_ring_prod__submit(&xsk->tx, 1);
 			xsk->outstanding_tx++;
+//			printf("%s %d %d\n",__FILE__,__LINE__,xsk->outstanding_tx);
 			return true;
 		}
 	}else{
@@ -520,15 +560,23 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	return false;
 }
 
-static void handle_receive_packets(struct xsk_socket_info *xsk)
+// High-precision clock grabber
+static inline uint64_t get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static uint32_t handle_receive_packets(struct xsk_socket_info *xsk)
 {
 	unsigned int rcvd, stock_frames, i;
-	uint32_t idx_rx = 0, idx_fq = 0;
+	uint32_t idx_rx = 0, idx_fq = 0, tx_idx = 0;
 	int ret;
 
 	rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
 	if (!rcvd)
-		return;
+		return 0;
+//	printf("%s %d %d\n",__FILE__,__LINE__,rcvd);
 
 	/* Stuff the ring with as much frames as possible */
 	stock_frames = xsk_prod_nb_free(&xsk->umem->fq,
@@ -550,21 +598,34 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 
 		xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
 	}
-
+	// Reserve identical space in the TX ring immediately
+ 	while (xsk_ring_prod__reserve(&xsk->tx, rcvd, &tx_idx) != rcvd) {
+		// If TX ring is full, force an immediate hardware kick
+ 		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	}
 	/* Process received packets */
+	int tx_ready = 0;
 	for (i = 0; i < rcvd; i++) {
 		uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
 		uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
 
-		if (!process_packet(xsk, addr, len))
+		if (!process_packet(xsk, addr, len, tx_idx + tx_ready)){
 			xsk_free_umem_frame(xsk, addr);
+		}else{
+			tx_ready++;
+		}
 
 	}
-
+	// 2. PAD THE DELTA: Fill remaining unused slots with length 0
+	for (unsigned int i = tx_ready; i < rcvd; i++) {
+		struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx + i);
+		tx_desc->addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->addr;; // Pass a valid token address
+		tx_desc->len = 0;                     // CRITICAL: 0 length tells kernel to drop silently
+	}
 	xsk_ring_cons__release(&xsk->rx, rcvd);
+	xsk_ring_prod__submit(&xsk->tx, tx_ready);
 
-	/* Do we need to wake up the kernel for transmission */
-	complete_tx(xsk);
+	return tx_ready;
   }
 
 static void rx_and_process(struct config *cfg,
@@ -572,10 +633,15 @@ static void rx_and_process(struct config *cfg,
 {
 	struct pollfd fds[2];
 	int ret, nfds = 1;
+	uint32_t pending_tx_count = 0;
+	uint64_t last_tx_flush_time = get_time_ns();
+
 
 	memset(fds, 0, sizeof(fds));
 	fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
 	fds[0].events = POLLIN;
+
+	printf("poll mode %d\n",cfg->xsk_poll_mode);
 
 	while(!global_exit) {
 		if (cfg->xsk_poll_mode) {
@@ -583,7 +649,18 @@ static void rx_and_process(struct config *cfg,
 			if (ret <= 0 || ret > 1)
 				continue;
 		}
-		handle_receive_packets(xsk_socket);
+		pending_tx_count += handle_receive_packets(xsk_socket);
+		// 2. Adaptive Flush Evaluation (Time vs. Capacity)
+		uint64_t now = get_time_ns();
+		if (pending_tx_count >= BATCH_SIZE || 
+			(pending_tx_count > 0 && (now - last_tx_flush_time) >= TX_FLUSH_TIMEOUT_NS)) {
+            
+			// Clean up sent packets from the Completion Ring
+			complete_tx(xsk_socket);
+            
+			pending_tx_count = 0;
+			last_tx_flush_time = now;
+	        }
 	}
 }
 
@@ -602,16 +679,74 @@ static void exit_application(int signal)
 	global_exit = true;
 }
 
-int main(int argc, char **argv)
-{
+void core_n_thread(void* arg){
 	void *packet_buffer;
 	uint64_t packet_buffer_size;
-	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
 	struct xsk_umem_info *umem;
 	struct xsk_socket_info *xsk_socket;
+	int core_idx = (int)arg;
+	cpu_set_t cpuset;
+	pthread_t thread;
+
+	thread = pthread_self();
+
+	CPU_ZERO(&cpuset);
+	CPU_SET(core_idx, &cpuset);
+
+	pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset);
+
+	/* Allocate memory for NUM_FRAMES of the default XDP frame size */
+	packet_buffer_size = ((NUM_FRAMES * FRAME_SIZE)/2097152)*2097152;
+#if 1
+	if (posix_memalign(&packet_buffer,
+			   getpagesize(), /* PAGE_SIZE aligned */
+			   packet_buffer_size)) {
+		fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n",
+			strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+#else
+	packet_buffer = mmap(NULL, packet_buffer_size, PROT_READ | PROT_WRITE, 
+			                  MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (packet_buffer == NULL){
+		printf("cannot allocate mapped memory\n");
+		exit(EXIT_FAILURE);
+	}
+#endif
+
+	/* Initialize shared packet_buffer for umem usage */
+	umem = configure_xsk_umem(packet_buffer, packet_buffer_size);
+	if (umem == NULL) {
+		fprintf(stderr, "ERROR: Can't create umem \"%s\"\n",
+			strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	/* Open and configure the AF_XDP (xsk) socket */
+//	cfg.xdp_flags = XDP_FLAGS_DRV_MODE;
+	xsk_socket = xsk_configure_socket(&cfg, umem, core_idx);
+	if (xsk_socket == NULL) {
+		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
+			strerror(errno));
+//		exit(EXIT_FAILURE);
+		return;
+	}
+	check_zerocopy_status(xsk_socket->xsk);
+
+	/* Receive and count packets than drop them */
+	rx_and_process(&cfg, xsk_socket);
+
+	/* Cleanup */
+	xsk_socket__delete(xsk_socket->xsk);
+	xsk_umem__delete(umem->umem);
+	free(packet_buffer);
+}
+
+int main(int argc, char **argv)
+{
 	int err;
 	char errmsg[1024];
-
+	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
 	/* Global shutdown handler */
 	signal(SIGINT, exit_application);
 
@@ -678,48 +813,19 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* Allocate memory for NUM_FRAMES of the default XDP frame size */
-	packet_buffer_size = ((NUM_FRAMES * FRAME_SIZE)/2097152)*2097152;
-#if 0
-	if (posix_memalign(&packet_buffer,
-			   getpagesize(), /* PAGE_SIZE aligned */
-			   packet_buffer_size)) {
-		fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
+	long n_procs = sysconf(_SC_NPROCESSORS_ONLN);
+	pthread_t threads[n_procs];
+	for (int core_idx = 0; core_idx < n_procs; core_idx++){
+		pthread_t thread;
+		if (pthread_create(&thread, NULL, core_n_thread, core_idx)){
+			printf("Cannot create a thread %d %s\n",core_idx,strerror(errno));
+		}else{
+			threads[core_idx] = thread;
+		}
 	}
-#else
-	packet_buffer = mmap(NULL, packet_buffer_size, PROT_READ | PROT_WRITE, 
-			                  MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-	if (packet_buffer == NULL){
-		printf("cannot allocate mapped memory\n");
-		exit(EXIT_FAILURE);
+	for (int core_idx = 0; core_idx < n_procs; core_idx++){
+		pthread_join(threads[core_idx], NULL);
 	}
-#endif
-
-	/* Initialize shared packet_buffer for umem usage */
-	umem = configure_xsk_umem(packet_buffer, packet_buffer_size);
-	if (umem == NULL) {
-		fprintf(stderr, "ERROR: Can't create umem \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	/* Open and configure the AF_XDP (xsk) socket */
-	xsk_socket = xsk_configure_socket(&cfg, umem);
-	if (xsk_socket == NULL) {
-		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	/* Receive and count packets than drop them */
-	rx_and_process(&cfg, xsk_socket);
-
-	/* Cleanup */
-	xsk_socket__delete(xsk_socket->xsk);
-	xsk_umem__delete(umem->umem);
-	free(packet_buffer);
 
 	return EXIT_OK;
 }
